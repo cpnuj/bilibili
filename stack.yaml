@@ -1,0 +1,4 @@
+packages:
+- .
+resolver: lts-19.33
+system-ghc: true
