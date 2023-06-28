@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveAnyClass #-}
 
 module Main (main) where
 
@@ -13,10 +13,15 @@ import Data.Aeson
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as S
 import Data.Conduit.Combinators (iterM)
+import Data.Text.Lazy (pack)
+
+--
+-- Json data definitions to resolve resource url
+--
 
 data Video = Video
-  { videoId :: Int
-  , baseUrl :: String
+  { videoId  :: Int
+  , videoUrl :: String
   }
   deriving (Eq, Show)
 
@@ -24,16 +29,56 @@ instance FromJSON Video where
   parseJSON (Object v) = Video <$> v .: "id" <*> v .: "base_url"
   parseJSON _ = empty
 
-newtype Dash = Dash { video :: [Video] } deriving (Eq, Show, Generic, FromJSON)
+data Audio = Audio
+  { audioId  :: Int
+  , audioUrl :: String
+  }
+  deriving (Eq, Show)
+
+instance FromJSON Audio where
+  parseJSON (Object v) = Audio <$> v .: "id" <*> v .: "base_url"
+  parseJSON _ = empty
+
+data Dash = Dash
+  { video :: [Video]
+  , audio :: [Audio]
+  }
+  deriving (Eq, Show, Generic, FromJSON)
 
 newtype Datum = Datum { dash :: Dash } deriving (Eq, Show, Generic, FromJSON)
 
 newtype DashUrl = Stuff
-    { datum :: Datum } deriving (Eq, Show)
+  { datum :: Datum } deriving (Eq, Show)
 
 instance FromJSON DashUrl where
   parseJSON (Object v) = Stuff <$> v .: "data"
   parseJSON _ = empty
+
+fetchVideoUrl :: DashUrl -> String
+fetchVideoUrl = videoUrl . head . video . dash . datum
+
+fetchAudioUrl :: DashUrl -> String
+fetchAudioUrl = audioUrl . head . audio . dash . datum
+
+fetchResource :: String -> FilePath -> IO ()
+fetchResource url ofile = do
+  request' <- parseRequest url
+  let request = setRequestMethod "GET"
+              . setRequestHeader "Referer" ["https://www.bilibili.com"]
+              . setRequestHeader "User-Agent" ["Wget/1.21.3"]
+              $ request'
+
+  let style = setProgressStylePrefix (msg $ pack ofile) progressStyle
+
+  httpSink request $ \r -> do
+    let total = read . filter ('"' /=) . show . head $ getResponseHeader "Content-Length" r :: Int
+    _ <- iterM (S.appendFile ofile)
+      .| foldMC showProgress (newProgressBar style 10 (Progress 0 total ()))
+    sinkNull
+
+--
+-- progress bar utils
+--
 
 progressStyle :: Style s
 progressStyle = Style
@@ -55,6 +100,9 @@ progressStyle = Style
   , styleOnComplete = WriteNewline
   }
 
+setProgressStylePrefix :: Label s -> Style s -> Style s
+setProgressStylePrefix prefix s = s { stylePrefix = prefix } 
+
 showProgress :: IO (ProgressBar ()) -> ByteString -> IO (IO (ProgressBar ()))
 showProgress iop input = do
   p <- iop
@@ -63,21 +111,22 @@ showProgress iop input = do
 
 main :: IO ()
 main = do
-  response <- httpJSON "https://api.bilibili.com/x/player/playurl?bvid=BV1YW4y197Pe&cid=1162298090&fnval=16"
+  let api  = "https://api.bilibili.com/x/player/playurl"
 
-  let resp = (getResponseBody response :: DashUrl)
-  let url = (baseUrl . head . video . dash . datum) resp
+  let bvid  = "BV1YW4y197Pe"
+  let cid   = "1162298090"
+  let query = [("bvid", Just bvid), ("cid", Just cid), ("fnval", Just "16")]
 
-  request' <- parseRequest url
-  let request = setRequestMethod "GET"
-              $ setRequestHeader "Referer" ["https://www.bilibili.com"]
-              $ setRequestHeader "User-Agent" ["Wget/1.21.3"]
-              $ request'
+  req' <- parseRequest api
+  let req = setRequestMethod "GET"
+          . setRequestQueryString query
+          $ req'
 
-  httpSink request $ \r -> do
-    let total = read . filter ('"' /=) . show . head $ getResponseHeader "Content-Length" r :: Int
-    _ <- iterM (S.appendFile "video.m4s")
-      .| foldMC showProgress (newProgressBar progressStyle 10 (Progress 0 total ()))
-    sinkNull
+  response <- httpJSON req
+
+  let playurl = (getResponseBody response :: DashUrl)
+
+  fetchResource (fetchVideoUrl playurl) (show bvid ++ ".video.m4s")
+  fetchResource (fetchAudioUrl playurl) (show bvid ++ ".audio.m4s")
 
   return ()
