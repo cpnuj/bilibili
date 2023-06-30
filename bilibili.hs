@@ -14,6 +14,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as S
 import Data.Conduit.Combinators (iterM)
 import Data.Text.Lazy (pack)
+import Data.Text (unpack)
+import Data.Text.Encoding (decodeUtf8)
 
 --
 -- Json data definitions to resolve resource url
@@ -62,6 +64,8 @@ fetchAudioUrl = audioUrl . head . audio . dash . datum
 
 fetchResource :: String -> FilePath -> IO ()
 fetchResource url ofile = do
+  putStrLn url
+
   request' <- parseRequest url
   let request = setRequestMethod "GET"
               . setRequestHeader "Referer" ["https://www.bilibili.com"]
@@ -126,7 +130,7 @@ main = do
 
   let playurl = (getResponseBody response :: DashUrl)
 
-  fetchResource (fetchVideoUrl playurl) (show bvid ++ ".video.m4s")
-  fetchResource (fetchAudioUrl playurl) (show bvid ++ ".audio.m4s")
+  fetchResource (fetchVideoUrl playurl) ((unpack . decodeUtf8) bvid ++ ".video.m4s")
+  fetchResource (fetchAudioUrl playurl) ((unpack . decodeUtf8) bvid ++ ".audio.m4s")
 
   return ()
