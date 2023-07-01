@@ -4,18 +4,24 @@
 
 module Main (main) where
 
-import Control.Applicative (empty)
-import System.ProgressBar
 import GHC.Generics (Generic)
-import Conduit
-import Network.HTTP.Simple
-import Data.Aeson
+import Control.Applicative (empty)
+import Control.Concurrent.Async (concurrently_)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Conduit (runResourceT, sinkFile)
+import Data.Aeson (FromJSON(parseJSON), Value(Object), (.:))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as S
-import Data.Conduit.Combinators (iterM)
-import Data.Text.Lazy (pack)
+-- import Data.Conduit.Combinators (iterM)
+-- import Data.Text.Lazy (pack)
 import Data.Text (unpack)
 import Data.Text.Encoding (decodeUtf8)
+-- import Conduit
+import Data.Conduit
+import Network.HTTP.Conduit
+import Network.HTTP.Simple (getResponseHeader, setRequestHeader, setRequestMethod, httpJSON, getResponseBody, setRequestQueryString)
+import System.Console.AsciiProgress
+import System.Process
 
 --
 -- Json data definitions to resolve resource url
@@ -62,59 +68,33 @@ fetchVideoUrl = videoUrl . head . video . dash . datum
 fetchAudioUrl :: DashUrl -> String
 fetchAudioUrl = audioUrl . head . audio . dash . datum
 
+updateProgress :: MonadIO m => ProgressBar -> ConduitM ByteString ByteString m ()
+updateProgress pg = await >>= maybe (return ()) (\chunk -> do
+    let len = S.length chunk
+    liftIO $ tickN pg len
+    yield chunk
+    updateProgress pg)
+
 fetchResource :: String -> FilePath -> IO ()
 fetchResource url ofile = do
-  putStrLn url
-
+  -- putStrLn url
+  manager <- newManager tlsManagerSettings
   request' <- parseRequest url
-  let request = setRequestMethod "GET"
-              . setRequestHeader "Referer" ["https://www.bilibili.com"]
+  let request = setRequestHeader "Referer" ["https://www.bilibili.com"]
               . setRequestHeader "User-Agent" ["Wget/1.21.3"]
               $ request'
-
-  let style = setProgressStylePrefix (msg $ pack ofile) progressStyle
-
-  httpSink request $ \r -> do
-    let total = read . filter ('"' /=) . show . head $ getResponseHeader "Content-Length" r :: Int
-    _ <- iterM (S.appendFile ofile)
-      .| foldMC showProgress (newProgressBar style 10 (Progress 0 total ()))
-    sinkNull
-
---
--- progress bar utils
---
-
-progressStyle :: Style s
-progressStyle = Style
-  { styleOpen    = "["
-  , styleClose   = "]"
-  , styleDone    = '='
-  , styleCurrent = '>'
-  , styleTodo    = '.'
-  , stylePrefix  = msg "Bilibili"
-  , stylePostfix = percentage
-  , styleWidth   = ConstantWidth 80
-  , styleEscapeOpen    = const ""
-  , styleEscapeClose   = const ""
-  , styleEscapeDone    = const ""
-  , styleEscapeCurrent = const ""
-  , styleEscapeTodo    = const ""
-  , styleEscapePrefix  = const ""
-  , styleEscapePostfix = const ""
-  , styleOnComplete = WriteNewline
-  }
-
-setProgressStylePrefix :: Label s -> Style s -> Style s
-setProgressStylePrefix prefix s = s { stylePrefix = prefix } 
-
-showProgress :: IO (ProgressBar ()) -> ByteString -> IO (IO (ProgressBar ()))
-showProgress iop input = do
-  p <- iop
-  incProgress p (S.length input)
-  return $ return p
+  runResourceT $ do
+    response <- http request manager
+    let total = read . filter ('"' /=) . show . head $ getResponseHeader "Content-Length" response
+    pg <- liftIO $ newProgressBar def
+      { pgFormat = ofile ++ " [:bar] :percent"
+      , pgTotal = total, pgWidth = 100
+      , pgOnCompletion = Just $ ofile ++ " done"}
+    runConduit $ responseBody response .| updateProgress pg .| sinkFile ofile
+    liftIO $ complete pg
 
 main :: IO ()
-main = do
+main = displayConsoleRegions $ do
   let api  = "https://api.bilibili.com/x/player/playurl"
 
   let bvid  = "BV1YW4y197Pe"
@@ -130,7 +110,16 @@ main = do
 
   let playurl = (getResponseBody response :: DashUrl)
 
-  fetchResource (fetchVideoUrl playurl) ((unpack . decodeUtf8) bvid ++ ".video.m4s")
-  fetchResource (fetchAudioUrl playurl) ((unpack . decodeUtf8) bvid ++ ".audio.m4s")
+  let bs2str = unpack . decodeUtf8
+  let fvideo = bs2str bvid ++ ".video.m4s"
+  let faudio = bs2str bvid ++ ".audio.m4s"
+  let fall = bs2str bvid ++ ".mp4"
+
+  let t1 = fetchResource (fetchVideoUrl playurl) fvideo
+  let t2 = fetchResource (fetchAudioUrl playurl) faudio
+
+  concurrently_ t1 t2
+
+  _ <- createProcess $ (shell $ "ffmpeg -n -i " ++ fvideo ++ " -i " ++ faudio ++ " -codec copy " ++ fall) { std_out = NoStream, std_err = NoStream }
 
   return ()
